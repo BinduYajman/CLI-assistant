@@ -3,6 +3,10 @@ from typing import Literal
 import argparse
 import os
 import json
+import re
+import requests
+from functools import lru_cache
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from groq import (
     Groq,
@@ -12,6 +16,46 @@ from groq import (
     APIConnectionError,
     APIStatusError
 )
+
+total_cost = 0.0
+
+@lru_cache(maxsize=None)
+def get_model_pricing(model_id):
+    url = "https://console.groq.com/docs/models"
+
+    response = requests.get(url, timeout=15)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    page_text = soup.get_text(separator=" ", strip=True)
+
+    model_index = page_text.find(model_id)
+
+    if model_index == -1:
+        raise ValueError(f"Model {model_id} not found.")
+
+    model_text = page_text[model_index:model_index + 300]
+
+    match = re.search(
+        r"\$([\d.]+)\s*input\s*\$([\d.]+)\s*output",
+        model_text
+    )
+
+    if not match:
+        raise ValueError(f"Pricing information unavailable for {model_id}.")
+
+    input_price = float(match.group(1))
+    output_price = float(match.group(2))
+
+    return input_price, output_price
+
+def calculate_cost(input_tokens, output_tokens, input_price, output_price):
+    input_cost = (input_tokens / 1_000_000) * input_price
+    output_cost = (output_tokens / 1_000_000) * output_price
+
+    total_cost = input_cost + output_cost
+
+    return total_cost
 
 load_dotenv()
 
@@ -52,28 +96,62 @@ class TextSummary(BaseModel):
     sentiment: Literal["positive", "neutral", "negative"]
     one_line_summary: str
 
-def ask_groq(question):
+def ask_groq(question, model):
 
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
+            model=model,
             messages=[
                 {
                     "role": "user",
                     "content": question
                 }
-            ]
+            ],
+            stream=True
         )
 
-        usage = response.usage
+        collected_content = []
+        usage = None
+
+        for chunk in response:
+            if chunk.choices:
+                content = chunk.choices[0].delta.content
+
+                if content:
+                    print(content, end="", flush=True)
+                    collected_content.append(content)
+
+            if chunk.usage:
+                usage = chunk.usage
+
+        print()
+        assistant_reply = "".join(collected_content)
+
+        global total_cost
 
         if usage:
-            print("\n--- Token Usage ---")
-            print(f"Input tokens: {usage.prompt_tokens}")
-            print(f"Output tokens: {usage.completion_tokens}")
-            print(f"Total tokens: {usage.total_tokens}")
+            input_tokens = usage.prompt_tokens
+            output_tokens = usage.completion_tokens
 
-        return response.choices[0].message.content
+            input_price, output_price = get_model_pricing(model)
+
+            cost = calculate_cost(
+                input_tokens,
+                output_tokens,
+                input_price,
+                output_price
+            )
+
+            total_cost += cost
+
+            print("\n--- Token Usage ---")
+            print(f"Input tokens: {input_tokens}")
+            print(f"Output tokens: {output_tokens}")
+            print(f"Total tokens: {usage.total_tokens}")
+            print(f"Estimated cost: ${cost:.8f}")
+            print(f"Running total cost: ${total_cost:.8f}")
+
+        return assistant_reply
 
     except (AuthenticationError, RateLimitError,
             NotFoundError, APIConnectionError, APIStatusError) as error:
@@ -131,16 +209,20 @@ def structured_extract(text):
         return None
         
 
-def load_history():
+def load_history(session):
+    filename = f"history_{session}.json"
+
     try:
-        with open("history.json", "r") as file:
+        with open(filename, "r") as file:
             return json.load(file)
 
     except FileNotFoundError:
         return []
 
-def save_history(messages):
-    with open("history.json", "w") as file:
+def save_history(messages, session):
+    filename = f"history_{session}.json"
+
+    with open(filename, "w") as file:
         json.dump(messages, file, indent=4)
 
 def clear_history():
@@ -166,9 +248,10 @@ def trim_history(messages, max_turns=20):
 
     return system_messages + conversation[-(max_turns * 2):]
 
-def interactive_chat():
+def interactive_chat(model,session):
+    global total_cost
 
-    messages = load_history()
+    messages = load_history(session)
 
     print("\nAI Assistant started!")
     print("Type 'quit' or 'exit' to stop.\n")
@@ -181,7 +264,7 @@ def interactive_chat():
             continue
 
         if user_input.lower() in ["quit", "exit"]:
-            save_history(messages)
+            save_history(messages,session)
             print("Goodbye!")
             break
 
@@ -192,8 +275,9 @@ def interactive_chat():
 
         try:
             response = client.chat.completions.create(
-                model="openai/gpt-oss-20b",
-                messages=trim_history(messages)
+                model=model,
+                messages=trim_history(messages),
+                stream=True
             )
 
         except (AuthenticationError, RateLimitError,
@@ -202,7 +286,46 @@ def interactive_chat():
             handle_api_error(error)
             continue
 
-        assistant_reply = response.choices[0].message.content
+        collected_content = []
+        usage = None
+
+        for chunk in response:
+            if chunk.choices:
+                content = chunk.choices[0].delta.content
+
+                if content:
+                    print(content, end="", flush=True)
+                    collected_content.append(content)
+
+            if chunk.usage:
+                usage = chunk.usage
+
+        print()
+
+        assistant_reply = "".join(collected_content)
+
+        if usage:
+            input_tokens = usage.prompt_tokens
+            output_tokens = usage.completion_tokens
+
+            input_price, output_price = get_model_pricing(model)
+
+            cost = calculate_cost(
+                input_tokens,
+                output_tokens,
+                input_price,
+                output_price
+            )
+
+            total_cost += cost
+
+            print("\n--- Token Usage ---")
+            print(f"Input tokens: {input_tokens}")
+            print(f"Output tokens: {output_tokens}")
+            print(f"Total tokens: {usage.total_tokens}")
+            print(f"Estimated cost: ${cost:.8f}")
+            print(f"Running total cost: ${total_cost:.8f}")
+
 
         print("\nAssistant:", assistant_reply, "\n")
 
@@ -211,7 +334,7 @@ def interactive_chat():
             "content": assistant_reply
         })
 
-        save_history(messages)
+        save_history(messages,session)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -243,10 +366,23 @@ def main():
         help="Clear conversation history"
     )
 
+    parser.add_argument(
+    "--model",
+    default="openai/gpt-oss-20b",
+    help="Model to use for generating responses"
+    )
+
+    parser.add_argument(
+    "--session",
+    default="default",
+    help="Name of the conversation session"
+    )
+
     args = parser.parse_args()
 
     if args.clear:
         clear_history()
+
     elif args.structured:
         result = structured_extract(args.structured)
         if result is not None:
@@ -254,12 +390,12 @@ def main():
             print(result.model_dump_json(indent=2))
 
     elif args.question:
-        answer = ask_groq(args.question)
+        answer = ask_groq(args.question, args.model)
         if answer is not None:
             print("\nAssistant:", answer)
 
     else:
-        interactive_chat()
+        interactive_chat(args.model, args.session)
 
     if args.system:
         print("Custom system prompt:", args.system)
