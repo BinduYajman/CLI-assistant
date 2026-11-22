@@ -1,6 +1,4 @@
 .env
 .venv/
 __pycache__/
-history.json
-history_college.json
-history_projects.json
+history*.json
